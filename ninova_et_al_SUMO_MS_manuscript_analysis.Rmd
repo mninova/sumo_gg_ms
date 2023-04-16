@@ -1,0 +1,583 @@
+---
+title: "diGly_site_analsyis_revision_2023"
+author: "Maria Ninova"
+date: '2032-02-09'
+output:
+  pdf_document: default
+  html_document:
+    code_folding: hide
+    keep_md: yes
+---
+
+## R setup
+
+```{r setup, message=FALSE }
+knitr::opts_chunk$set(echo = TRUE, dev=c("pdf","png"), cache = TRUE)
+library(tidyverse)
+library(seqinr)
+library(DT)
+library(ggplot2)
+library(ggseqlogo)
+library(clusterProfiler)
+library(GOSemSim)
+options(digits=2, scipen=999)
+path<-getwd()
+motif<-"(A|I|L|M|F|V|P|G|W)K.(D|E)" #sumoylation motif
+fasta<-seqinr::read.fasta(paste0(path,"/UniProt_FruitFly_oneLine.fasta"),seqtype = "AA", strip.desc = T, whole.header = T, as.string = T)
+gene.info<-cbind.data.frame("UniProt"=sub(".*\\|(.*)\\|.*","\\1",names(fasta)), "SYMBOL"=sub("\\s.*","",sub(".*GN=","", names(fasta))))
+select<-dplyr::select #make sure it is not overridden
+```
+
+### Parsing maxquant data
+
+The set of SUMOylated sites were defined by comparative LC-MS/MS of ovaries expressing 6XHIS-SUMO-T86R (TR-SUMO) under the control of the endogenous SUMO promoter, or flies without this transgenes. Resulting data was analyzed by MaxQuant. We use the MaxQuant generated diGly site table and add some useful information like gene symbol, full protein sequence, 20 aminoacid window around the motification (useful for motif search), the ratio of intensity in TR-SUMO vs control samples for each experiment. 
+
+```{r lbl_free_data}
+all<-read.table(paste0(path,"/data_merged/GlyGly_sites.txt"), header=T, fill=T, sep="\t", quote="")
+#table cleanup
+all.clean<-all %>% filter(!str_detect(Leading.proteins,"REV"))
+all.clean$prot1<-sub(";.*","", all.clean$Proteins)
+all.clean$pos1<-as.numeric(sub(";.*","", all.clean$Positions.within.proteins))
+all.clean$header1<-sub(";.*","", all.clean$Fasta.headers)
+
+#extracting protein sequence before and after the target site
+add_motif<-function(header,pos,fasta_db=fasta) {
+b<-substr(fasta_db[[header]][1],pos-10, pos) #extract 10 preceding aa + target K (11 aa total)
+b<-str_glue(strrep(".",11-str_length(b)),b) #adding empty characters in case it was near the start
+a<-substr(fasta_db[[header]][1],pos+1,pos+10)  #extract 10 aa after target K 
+a<-str_glue(a,strrep(".",10-str_length(a))) ##adding empty characters in case it was near the end
+return(str_glue(b,a))
+}
+
+
+data<-all.clean %>%  rowwise() %>% mutate("fullseq"=fasta[[header1]][1]) %>% rowwise() %>% mutate("K_window"=add_motif(header1,pos1)) %>% mutate("motif"=grepl("(A|I|L|M|F|V|P|G|W)K.(D|E)",K_window)) %>% mutate(ratio1=Intensity.TR.SUMO.1/Intensity.Ctrl.1, ratio2=Intensity.TR.SUMO.2/Intensity.Ctrl.2, ratio3=Intensity.TR.SUMO.3/Intensity.Ctrl.3)
+data$gene<-sub("\\-R[A-Z]$","",sub(".*GN=","",sub(".*(GN=.*);.*","\\1",sub(".*(GN=.*) PE.*","\\1",data$Fasta.headers))))
+df<-data %>% filter(Intensity.TR.SUMO.1+Intensity.TR.SUMO.2+Intensity.TR.SUMO.3+Intensity.Ctrl.1+Intensity.Ctrl.2+Intensity.Ctrl.3>0) %>% select(gene,prot1, pos1, K_window, PEP, matches("Intensity.Ctrl.\\d+$|Intensity.TR.SUMO.\\d+$"), matches("^ratio\\d$"))
+
+DT::datatable(df)
+```
+
+
+###diGly sites stats
+
+#### Figure 2A
+Violin plots showing peptide intensity distributions per sample.
+
+```{r Fig2A_basic_stats_viol, fig.width=4, fig.height=4, out.height=400, out.width=400}
+df.box<-df %>% select(matches("Intensity"), K_window) #renaming here bc it is easier to order ggplot by name
+names(df.box)<-c("rep1#ctrl", "rep2#ctrl", "rep3#ctrl","rep1#SUMO-TR", "rep2#SUMO-TR", "rep3#SUMO-TR","K_window")
+stat_box_data <- function(x){return(c(y = 35, label = length(x)))}
+df.box %>% pivot_longer(!K_window) %>% filter(value>0) %>% ggplot() + geom_violin(aes(x=name, y=log2(value+1))) + geom_boxplot(aes(x=name, y=log2(value+1)), width=0.1) + ylab("log2(Intensity+1)") + xlab("") + theme_minimal() + theme(axis.text.x = element_text(size=8, angle=90, hjust = 1)) + stat_summary(aes(x=name, y=log(value+1)),fun.data = stat_box_data, geom = "text")
+```
+
+#### Figure 2B
+Histograms of intensity ratios. Ratios are binned in intervals. 
+The upper interval contains all sites with ratios above 10, including those where the SUMO-TR/Control ratio = Inf (because of 0 values in the control).
+
+```{r Fig2B_basic_stats_ratio_hist,fig.width=4, fig.height=4, out.height=400, out.width=400 }
+bin<-c("0","(0,1]","(1,2]","(2,3]","(3,4]","(4,5]","(5,6]","(6,7]","(7,8]","(8,9]","(9,10]","(10,max)", "Inf") 
+
+hist.dat<-function(vec) {
+infs<-length(which(is.infinite((vec))))
+fins<-vec[which(!is.infinite(vec))]
+dat.h<-c(table(cut(fins,breaks=c(-1,0:10, max(fins)))),"sumo_only"=infs)
+names(dat.h)[length(dat.h)-1]<-"(10,max]"
+return(data.frame(dat.h) %>% rownames_to_column("bin"))
+}
+
+dat.h1<-hist.dat(df$ratio1[which(!is.na(df$ratio1))])                    
+dat.h2<-hist.dat(df$ratio2[which(!is.na(df$ratio2))])   
+dat.h3<-hist.dat(df$ratio3[which(!is.na(df$ratio3))]) 
+
+p1<-ggplot() + 
+  geom_col(data=dat.h1,aes(x=bin,y=dat.h), fill="orange", alpha=0.3, width=0.5) +
+  geom_col(data=dat.h2,aes(x=bin,y=dat.h), fill="red", alpha=0.3,width=0.6) + 
+  geom_col(data=dat.h3,aes(x=bin,y=dat.h), fill="green4", alpha=0.3, width=0.4) + 
+  xlab("SUMO-TR/Control Intensity") + ylab("Frequency") +  scale_x_discrete(labels=bin) + theme_minimal() + theme(axis.text.x = element_text(size=8, angle=90)) + ylim(0,1000)
+p1
+```
+
+
+#### Figure 2B and Supp. 1
+Sequence logos of sites with SUMO-TR/Control intensities over 10 or less than 10. Top: logos around sites with ratios >10 in each of the 3 experiments; Bottom: logos around sites with ratios <10 in each of the 3 experiments.
+
+```{r Fig2B_S1_logos, fig.width=12, fig.height=6, out.height=400, out.width=800}
+l1<-ggplot() + geom_logo(df %>% filter(ratio1>=10) %>% mutate(K=paste0(substr(K_window, 1,10),".",substr(K_window,12,21))) %>% pull(K)) + ylim(0,2)
+l2<-ggplot() + geom_logo(df %>% filter(ratio1<10) %>% mutate(K=paste0(substr(K_window, 1,10),".",substr(K_window,12,21))) %>% pull(K))  + ylim(0,2)
+l3<-ggplot() + geom_logo(df %>% filter(ratio2>=10) %>% mutate(K=paste0(substr(K_window, 1,10),".",substr(K_window,12,21))) %>% pull(K))  + ylim(0,2)
+l4<-ggplot() + geom_logo(df %>% filter(ratio2<10) %>% mutate(K=paste0(substr(K_window, 1,10),".",substr(K_window,12,21))) %>% pull(K))  + ylim(0,2)
+l5<-ggplot() + geom_logo(df %>% filter(ratio3>=10) %>% mutate(K=paste0(substr(K_window, 1,10),".",substr(K_window,12,21))) %>% pull(K))  + ylim(0,2)
+l6<-ggplot() + geom_logo(df %>% filter(ratio3<10) %>% mutate(K=paste0(substr(K_window, 1,10),".",substr(K_window,12,21))) %>% pull(K))  + ylim(0,2)
+
+gridExtra::grid.arrange(l1,l3,l5,l2,l4,l6, nrow=2)
+
+```
+
+#### Figure 2C
+Venn diagrams showing the overlap of bona fide SUMO sites (exact site level) found in each of the 3 experiments, or proteins with sites (gene level)
+
+```{r Fig2C_venn, fig.width=6, fig.height=4}
+x.site.merged=list( "Rep#1"=(df %>% filter(ratio1>=10) %>% pull(K_window) %>% unique()), 
+                    "Rep#2"=(df %>% filter(ratio2>=10) %>% pull(K_window) %>% unique()), 
+                    "Rep#3"=(df %>% filter(ratio3>=10) %>% pull(K_window) %>% unique()))
+
+#this are the reproducibly non-SUMOylated sites (not shown, generated for later use)
+bad.site.merged=list("Rep#1"=(df %>% filter(ratio1<3) %>% pull(K_window) %>% unique()), 
+                     "Rep#2"=(df %>% filter(ratio2<3) %>% pull(K_window) %>% unique()), 
+                     "Rep#3"=(df %>% filter(ratio3<3) %>% pull(K_window) %>% unique()))
+
+x.gene.merged=list( "Rep#1"=(df %>% filter(ratio1>=10) %>% pull(gene) %>% unique()), 
+                    "Rep#2"=(df %>% filter(ratio2>=10) %>% pull(gene) %>% unique()), 
+                    "Rep#3"=(df %>% filter(ratio3>=10) %>% pull(gene) %>% unique()))
+
+v1<-plot(eulerr::euler(x.site.merged), quantities=eulerr::euler(x.site.merged)$original, main="exact sites", fill=c("gold","red","orange"), alpha=0.2)
+v2<-plot(eulerr::euler(x.gene.merged), quantities=eulerr::euler(x.gene.merged)$original, main="proteins with SUMO site", fill=c("gold","red","orange"), alpha=0.2)
+gridExtra::grid.arrange(v1,v2, nrow=1)
+
+```
+
+
+#### Figure S2
+Analysis of the intensity of sites detected in only 1, 2 or all 3 experiments.
+
+```{r FigS2_intensity_vs_detectability, fig.width=6, fig.height=3, out.height=300, out.width=600}
+
+par(mfrow=c(1,3))
+sumo.site<-table(unlist(x.site.merged))
+a<-data %>% filter(K_window %in% names(which(sumo.site==3))) %>% pull(Intensity.TR.SUMO.1)
+b<-data %>% filter(K_window %in% intersect(names(which(sumo.site==2)), x.site.merged[[1]])) %>% pull(Intensity.TR.SUMO.1)
+c<-data %>% filter(K_window %in% intersect(names(which(sumo.site==1)), x.site.merged[[1]])) %>% pull(Intensity.TR.SUMO.1)
+boxplot(list("all 3"=log2(a+1),"#1&(#2|#3)"=log2(b+1), "#1 only" = log2(c+1)), ylab="log2(Intensity_exp#1+1)", las=2, ylim=c(10,40), main="SUMO-TR Rep1")
+
+a<-data %>% filter(K_window %in% names(which(sumo.site==3))) %>% pull(Intensity.TR.SUMO.2)
+b<-data %>% filter(K_window %in% intersect(names(which(sumo.site==2)), x.site.merged[[2]])) %>% pull(Intensity.TR.SUMO.2)
+c<-data %>% filter(K_window %in% intersect(names(which(sumo.site==1)), x.site.merged[[2]])) %>% pull(Intensity.TR.SUMO.2)
+boxplot(list("all 3"=log2(a+1),"exp#2&(#1|#3)"=log2(b+1), "#2 only" = log2(c+1)), ylab="log2(Intensity_exp#2+1)", las=2, ylim=c(10,40), main="SUMO-TR Rep2")
+
+a<-data %>% filter(K_window %in% names(which(sumo.site==3))) %>% pull(Intensity.TR.SUMO.3)
+b<-data %>% filter(K_window %in% intersect(names(which(sumo.site==2)), x.site.merged[[3]])) %>% pull(Intensity.TR.SUMO.3)
+c<-data %>% filter(K_window %in% intersect(names(which(sumo.site==1)), x.site.merged[[3]])) %>% pull(Intensity.TR.SUMO.3)
+boxplot(list("all 3"=log2(a+1),"exp#3&(#1|#2)"=log2(b+1), "#3 only" = log2(c+1)), ylab="log2(Intensity_exp#3 +1)", las=2,ylim=c(10,40), main="SUMO-TR Rep3")
+
+```
+
+
+#### Figure 2D
+Analysis of the number of SUMO sites per protein.
+This analysis is conservative as it considers the "high confidence" set of 340 proteins with bona fide SUMO sites, and calculates the numbers of exact SUMO sites detected in all 3 replicates.
+
+```{r Fig2D_sites_per_protein, warning=FALSE, fig.width=5, fig.height=4, out.height=200, out.width=200}
+kwin.common<-Reduce(intersect,x.site.merged)
+kwin.common.df<-data %>% filter(K_window %in% kwin.common) %>% dplyr::select(gene,prot1, pos1, K_window, PEP, fullseq, Number.of.GlyGly..K., matches("Intensity.Ctrl.\\d+$|Intensity.TR.SUMO.\\d+$"), matches("^ratio\\d$"))
+
+write.table(kwin.common.df,"kwin.common.df.tsv", sep="\t", quote = F, row.names = F, col.names = T) #save for conservation analysis
+
+doubles<-kwin.common.df %>% filter(prot1 %in% names(which(table(kwin.common.df$prot1)==2))) %>% dplyr::select(prot1, pos1) %>% group_by(prot1) %>% mutate(site = row_number()) %>% pivot_wider(names_from=prot1, values_from=pos1) %>% select(!site) %>% t() %>% as.data.frame()
+dist.doubles<-apply(doubles,1, function(x) {abs(as.numeric(x[1])-as.numeric(x[2]))})
+
+kwin.bad<-Reduce(intersect,bad.site.merged) #these are the "bad" sites with high background signal - table generated for later analysis
+kwin.bad.df<-data %>% filter(K_window %in% kwin.bad) %>% dplyr::select(gene,prot1, pos1, K_window, PEP, fullseq, Number.of.GlyGly..K., matches("Intensity.Ctrl.\\d+$|Intensity.TR.SUMO.\\d+$"), matches("^ratio\\d$"))
+
+#sites number barplot
+par(mfrow=c(1,2))
+barplot(summary(as.factor(table(kwin.bad.df$prot1))), xlab="site per protein", ylab="n proteins", las=2, col="black", cex.axis=0.5)
+boxplot(dist.doubles, main="dist bw 2 sites same prot", cex=0.5, ylab="distance")
+```
+
+#### Figure 2E
+Motif analysis within the conserved set of exact "bona fide" sites
+
+```{r Fig2E_motif_in_SUMO_pie, fig.width=6, fig.height=6, out.height=600, out.width=600}
+sites<-unique(kwin.common.df$K_window)
+#find consensus site exactly around the predicted diGly remnant
+n.cons<-which(str_detect(sites, "^.........(A|I|L|M|F|V|P|G|W)K.(D|E)")) 
+#find consensus site around the diGly remnant prediction (+/-10 aa), but not exactly at the predicted site
+n.cons.shift<-setdiff(which(str_detect(sites, "(A|I|L|M|F|V|P|G|W)K.(D|E)")), n.cons) 
+#find inverted consensus among the remaining sites
+n.inv<-setdiff(which(str_detect(sites,  "^........(D|E).K(A|I|L|M|F|V|P|G|W)")), union(n.cons, n.cons.shift))
+#remaining sites 
+other<-length(sites)-length(unique(c(n.cons,n.cons.shift,n.inv)))
+
+pie.dat<-data.frame(labels=c("1_other","4_cons.shift","3_cons","2_cons.inv"), value=c(other,length(n.cons.shift), length(n.cons), length(n.inv)))
+
+p1<-ggplot(pie.dat, aes(x = "" , y = value, fill = labels)) + geom_col(width = 1, color = 1) + coord_polar(theta = "y") + theme_void() + geom_text(aes(label = value), position = position_stack(vjust = 0.5))
+l1<-ggplot() + geom_logo(sites[n.cons])
+l2<-ggplot() + geom_logo(sites[n.cons.shift])
+l3<-ggplot() + geom_logo(sites[unique(setdiff(n.inv, union(n.cons, n.cons.shift)))])
+gridExtra::grid.arrange(p1,l1,l2,l3, nrow=2)
+```
+
+Plotting the top most frequent extended motifs in each category
+
+```{r Fig2E_motif_in_SUMO_extended, fig.width=6, fig.height=2, out.height=200, out.width=600}
+#10 aa flanking exact sites with consensus motif of shifted consensus motif ("KK" cases)
+c<-c(str_sub(sites[n.cons],6,16),str_sub(sites[n.cons.shift],5,15))
+#10 aa flanking inverse sites
+r<-c(str_sub(sites[n.inv],6,16))
+
+#sort by frequency of selected aa inside the consensus
+top.c<-table(sub("^....(.K).(.)...$","xxxx\\1x\\2xxx",unique(c))) %>% sort(decreasing=T)
+top.r<-table(sub("^...(.).(K.)....$","xxx\\1x\\2xxxx",unique(r))) %>% sort(decreasing=T)
+#and one aa after the consensus
+top.c1<-table(sub("^....(.K).(..)..$","xxxx\\1x\\2xx",unique(c))) %>% sort(decreasing=T)
+
+
+par(mfrow=c(1,3), mar=c(3,6,3,3))
+barplot(t(as.matrix(rev(head(top.c,5)))), las=2, horiz = T, cex.axis=0.5, main="Consensus")->b
+text(60, b, as.vector(rev(head(top.c,5))))
+barplot(t(as.matrix(rev(head(top.c1,5)))), las=2, horiz = T, cex.axis=0.5, main="Consensus+1")->b
+text(15, b, as.vector(rev(head(top.c1,5))))
+barplot(t(as.matrix(rev(head(top.r,5)))), las=2, horiz = T, cex.axis=0.5, main="Inv.consensus")->b
+text(10, b, as.vector(rev(head(top.r,5))))
+```
+
+#### Figure 2F, G & Supplementary Figure 3
+Analysis of SUMO site position with respect to secondary structure embeddings or IUPred2A scores.
+For IUPredA scores, fasta sequences of proteins with "bona fide" SUMO sites (SUMO-TR/Control ratio> 10), or background sites (ratio <3):
+
+> kwin.common.df %>% dplyr::select(prot1, fullseq) %>% unique()
+
+> kwin.bad.df %>% dplyr::select(prot1, fullseq) %>% unique()
+
+were submitted to the IUPred2A web server (IUPred2 short disorder). Scores per aminoacid are parsed from this output.
+
+**IUPred2A analysis**
+
+Here, median score was calculated around the SUMO site (or non-SUMO background site and random lysine) (+/- 5 aminoacids).
+
+```{r Fig2FG_iupred, fig.height=4, fig.width=4, out.height=400, out.width=400}
+#function to get the score at the predicted site +/- 5 aa and then take the median score
+get_iupred_score<-function(prot, pos, file) {
+region<-system(paste0("grep -A ",pos+6," '",prot,"' ",file," | tail -11|cut -f 1-3|grep -v '>'|grep -v '#'|grep [0-9]"), intern = T) %>% str_split("\t") %>% unlist() %>% matrix(ncol=3, byrow = T) %>% as.data.frame %>% transform(V1=as.numeric(V1), V3=as.numeric(V3))
+return(median(region$V3))
+}
+#for each SUMO site, calculate the median IUPred score around it, as well as the median IUPred score around a random lysine
+kwin.common.df<-kwin.common.df %>% mutate(k_rand=sample(data.frame(str_locate_all(fullseq,"K"))$start,1)) %>%
+  rowwise() %>% mutate("IDR_score"=get_iupred_score(prot1,pos1,"good_short.res"),"IDR_score_rand"=get_iupred_score(prot1,k_rand,"good_short.res"))
+#calculate the median IUPred score for the non-SUMO sites ("bad")
+kwin.bad.df<-kwin.bad.df %>% rowwise() %>% mutate("IDR_score"=get_iupred_score(prot1,pos1,"bad_short.res"))
+
+boxplot(kwin.common.df$IDR_score, kwin.common.df$IDR_score_rand, kwin.bad.df$IDR_score, names=c("SUMO sites", "rand K in SUMO target","non-SUMO diGly"), ylab="IDR score around K site", col="beige", las=2, main="IUPred2A scores vs SUMO sites", cex.axis=0.5, cex.main=0.5)
+```
+
+
+**bioembeddings analysis**
+
+Here, fasta files were used to generate binary scores for each aminoacid belonging to an IDR, sheet, helix region (X,E,H) via bioembeddings https://docs.bioembeddings.com/v0.2.3/api/index.html with default parameters.
+For each group of sites (SUMO sites and non-SUMO sites, the number of sites in different structural regions is calculated). Next, the number of sites in different structural regions is calculated for random lysines in the SUMO target proteins, and non-SUMO target proteins 1000 times.
+
+```{r Fig2FG_embeddings, fig.width=6, fig.height=3, out.height=300, out.width=600}
+par(mfrow=c(1,3))
+#number of sites per feature for bona fide SUMO sites 
+  emb<-read.csv("result_embeddings.txt", header=F)
+  kwin.common.df.emb<-kwin.common.df %>% left_join(emb, by=c("prot1"="V1")) %>% dplyr::select(gene, prot1, pos1, fullseq, V4, V5, K_window) %>% mutate(secondary=str_sub(V4, pos1, pos1), disordered=str_sub(V5, pos1, pos1)) 
+
+    #number of "bona fide" sites in disordered regions
+    n_dis<-kwin.common.df.emb %>% group_by(disordered) %>% tally()  %>% filter(disordered=="X")# (X means in disordered region)
+    #number of sites in helix and sheet regions
+    n_scnd<-kwin.common.df.emb %>% group_by(secondary) %>% tally() %>% filter(secondary!="C")#(H = helix, E=sheet, C="other")
+
+#number of sites per feature for non_SUMO sites
+  emb_bad<-read.csv("result_embeddings_bad.txt", header=F)
+  kwin.bad.df.emb<-kwin.bad.df %>% left_join(emb_bad, by=c("prot1"="V1")) %>% dplyr::select(gene, prot1, pos1, fullseq, V4, V5, K_window) %>% mutate(secondary=str_sub(V4, pos1, pos1), disordered=str_sub(V5, pos1, pos1)) 
+  
+    n_scnd_bad<-kwin.bad.df.emb %>% group_by(secondary) %>% tally() %>% filter(secondary!="C")
+    n_dis_bad<-kwin.bad.df.emb %>% group_by(disordered) %>% tally()  %>% filter(disordered=="X")
+    
+#number of sites per feature (sumo and non-SUMO) for randomly selected lysines
+  #random sampling among proteins that have SUMO site
+  sumo_prots_allKs<-sapply(kwin.common.df.emb$fullseq, function(x) {data.frame(str_locate_all(x,"K"))$start})
+  sumo_prots_1000K<-lapply(sumo_prots_allKs, function(x) {sample(x,1000, replace = T)})
+  sumo_prots_1000_scnd<-matrix(nrow=length(sumo_prots_allKs), ncol=1000)
+  for( i in 1:length(sumo_prots_allKs)) {sumo_prots_1000_scnd[i,]<-unlist(strsplit(kwin.common.df.emb$V4[i],""))[sumo_prots_1000K[[i]]]}
+  sumo_prots_1000_idr<-matrix(nrow=length(sumo_prots_allKs), ncol=1000)
+  for( i in 1:length(sumo_prots_allKs)) {sumo_prots_1000_idr[i,]<-unlist(strsplit(kwin.common.df.emb$V5[i],""))[sumo_prots_1000K[[i]]]}
+  rand_dis<-apply(sumo_prots_1000_idr,2, function(x) {length(which(x=="X"))})
+  rand_h<-apply(sumo_prots_1000_scnd,2, function(x) {length(which(x=="H"))})
+  rand_e<-apply(sumo_prots_1000_scnd,2, function(x) {length(which(x=="E"))})
+
+  # plot of results as % of total sites; sumo-derived GG sites in IDR and E/H vs random
+    total.sumo<-nrow(kwin.common.df.emb)
+    list.sumo<-list(rand_e/total.sumo, rand_h/total.sumo, rand_dis/total.sumo)
+    mean<-unlist(lapply(list.sumo, mean))
+    sd<-unlist(lapply(list.sumo, sd))
+    
+    barplot(as.matrix(t(data.frame("expected"=mean, "observed"=c(n_scnd$n, n_dis$n)/total.sumo, row.names=c("sheet","helix","IDR")))), beside=T, las=2, main="SUMOylated,n=421", ylim=c(0,0.5), col=c("grey50","blue"))->b
+    arrows(x0 = b[1,], x1 = b[1,], y0 = mean, y1 = mean+sd, angle = 90, col="blue", length = 0.01)
+    arrows(x0 = b[1,], x1 = b[1,], y0 = mean, y1 = mean-sd, angle = 90, col="blue", length = 0.01)
+    text(b[2,], 0.45 ,c(n_scnd$n, n_dis$n), cex=0.8, col="blue")
+  
+#random sampling among proteins that have GG background site
+  NONsumo_prots_allKs<-sapply(kwin.bad.df.emb$fullseq, function(x) {data.frame(str_locate_all(x,"K"))$start})
+  NONsumo_prots_1000K<-lapply(NONsumo_prots_allKs, function(x) {sample(x,1000, replace = T)})
+  NONsumo_prots_1000_scnd<-matrix(nrow=length(NONsumo_prots_allKs), ncol=1000)
+  for( i in 1:length(NONsumo_prots_allKs)) {NONsumo_prots_1000_scnd[i,]<-unlist(strsplit(kwin.bad.df.emb$V4[i],""))[NONsumo_prots_1000K[[i]]]}
+  NONsumo_prots_1000_idr<-matrix(nrow=length(NONsumo_prots_allKs), ncol=1000)
+  for( i in 1:length(NONsumo_prots_allKs)) {NONsumo_prots_1000_idr[i,]<-unlist(strsplit(kwin.bad.df.emb$V5[i],""))[NONsumo_prots_1000K[[i]]]}
+  rand_dis_bad<-apply(NONsumo_prots_1000_idr,2, function(x) {length(which(x=="X"))})
+  rand_h_bad<-apply(NONsumo_prots_1000_scnd,2, function(x) {length(which(x=="H"))})
+  rand_e_bad<-apply(NONsumo_prots_1000_scnd,2, function(x) {length(which(x=="E"))})
+
+    #plotting results as % of total sites 
+      total.nonsumo<-nrow(kwin.bad.df.emb)
+      list.nonsumo<-list(rand_e_bad/total.nonsumo, rand_h_bad/total.nonsumo, rand_dis_bad/total.nonsumo)
+      mean<-unlist(lapply(list.nonsumo, mean))
+      sd<-unlist(lapply(list.nonsumo, sd))
+      barplot(as.matrix(t(data.frame("expected"=mean, "observed"=c(n_scnd_bad$n, n_dis_bad$n)/total.nonsumo, row.names=c("sheet","helix","IDR")))), beside=T, las=2, main="nonSUMOylated, n=718", ylim=c(0,0.5),col=c("grey50","blue"))->b
+      arrows(x0 = b[1,], x1 = b[1,], y0 = mean, y1 = mean+sd, angle = 90, col="blue", length = 0.01)
+      arrows(x0 = b[1,], x1 = b[1,], y0 = mean, y1 = mean-sd, angle = 90, col="blue", length = 0.01)
+      text(b[2,],0.4, c(n_scnd_bad$n, n_dis_bad$n), cex=0.8, col="blue")
+      
+  #proportion of different motifs in IDR
+  motif.i<-"^........(D|E).K(A|I|L|M|F|V|P|G|W)"
+  motif.c<-"^.........(A|I|L|M|F|V|P|G|W)K.(D|E)"
+  motif.cs<-"^........(A|I|L|M|F|V|P|G|W)K.(D|E)" #when the K site is shifted with 1 bp
+
+  kwin.common.df.emb<-kwin.common.df.emb %>% mutate("cons"=ifelse(grepl(motif.c, K_window), "psiKxD/E", ifelse(grepl(motif.cs, K_window), "psiKKD/E", ifelse(grepl(motif.i, K_window), "D/ExKpsi","none"))))
+  d<-kwin.common.df.emb %>% select(cons,disordered) %>% group_by(cons,disordered) %>% tally() %>% pivot_wider(names_from=cons, values_from = n) %>% column_to_rownames("disordered") 
+
+  barplot(as.matrix(d["X",]/colSums(d)), las=2, ylab="fraction of K~GG sites in IDR", ylim=c(0,1))
+```
+
+
+#### Figure 2H - conservation analysis Drosophila
+
+
+Here, homologous genes in the 11 Drosophila species were extracted from flybase and multiple sequence alignments were performed with Muscle with default parameters. 5 genes eIF-2gamma, His2B, His3, Med and pre-mod_mdg4_-G were excluded because FlyBase doesn't have annotated homologs (not quite sure why). This code reads the multiple sequence alignment file, then finds the position in the alignment corresponding to D. mel diGly site and extracts the alignment block +/- 10 aa. 
+Folder "conservation analysis" holds the sequence alignments; each file is named GENESYMBOL_1.aln 
+We choose to work with proteins conserved in all 11 species for conservation analysis to avoid bias.
+
+```{r Fig2H_conservation, fig.width=6, fig.height=6, out.height=600, out.width=600}
+
+result<-list() #list of the 21 aminoacid alignment blocks aroung the target K in Melanogaster
+
+for (i in 1:nrow(kwin.common.df)) {
+  
+kwin<-kwin.common.df$K_window[i]
+pos<-kwin.common.df$pos1[i] # the actual position
+symbol<-kwin.common.df$gene[i]
+symbol.out<-sub("\\)","_",sub("\\(","_",symbol)) #some gene names containing special characters were changed because they cause problems in bash
+
+aln<-seqinr::read.alignment(paste0("conservation_analysis/individual_alignments/",symbol.out,"_1.aln"), format = "fasta")
+aln.seq.longer<-lapply(aln$seq,function(x) {paste0("----------",x,"----------")}) # this is a trick to make it easier when positions are towards the end of the alignment
+
+aln.tab<-as.data.frame(do.call(cbind,lapply(aln.seq.longer,function(x) {unlist(strsplit(x,""))})))
+names(aln.tab)<-aln$nam
+mel<-grep("#Dmel$",aln$nam) # position of the melanogaster sequence in the alignment block
+aln.tab$mel.id<-apply(aln.tab,1,function(x) {length(which(x==x[mel]))})
+
+#this loop identifies what position is the alignment is what position in the ungapped sequence
+p<-0 #the position in the aa sequence when "-" are removed
+
+for (k in 1:nrow(aln.tab)) {
+  if(aln.tab[k,mel]!='-') {p<-p+1}
+  if(p==pos) { 
+    #print(paste(pos,k,paste0(aln.tab[(k-10):(k+10),mel], collapse=""))) 
+    result[[paste0(symbol,"|",pos,"|",i)]]<-aln.tab[(k-10):(k+10),]
+    break
+  }}}
+
+species<-c("Dsim", "Dsec","Dere","Dyak","Dana","Dwil","Dpse","Dper","Dmoj","Dvir","Dgri")
+num.conserved<-cbind.data.frame("species"=unlist(lapply(result, function(x) {length(which(species %in% sub("\\\\.*","",names(x))==TRUE))})), "genes"=sub("\\|.*","", names(result))) %>% distinct() %>% arrange(genes)
+table(num.conserved$species) #of these, 246 genes are conserved in 11 species, in addition to mel: we call them cons11
+
+conserved11<-which(lapply(result, function(x) {length(which(species %in% sub("\\\\.*","",names(x))==TRUE))})==11)
+
+#some genes have multiple protein isoforms, but these rarely differ around the K-flanking region; we merge these isoforms if they are identical
+
+result.uniq<-list()
+
+for(i in 1:length(result)) {
+  test<-result[[i]]
+  sp.list<-list()
+  sp.list[["Dmel"]]<-as.vector(test[,grep("Dmel", names(test))])
+  for (s in species) { sp.list[[s]]<-as.vector(test[,grep(s, names(test))]) }
+  sp.list.nonr<-list()
+  
+  for (s in names(sp.list)) {
+      tmp<-sp.list[[s]]
+      if (!is.list(tmp)) {sp.list.nonr[[s]]<-tmp} else {     
+        tmp<-tmp[grep("[a-z]",lapply(tmp, function(x) {paste0(x, collapse="")}))] 
+        if (length(tmp)==0) {sp.list.nonr[[s]]<-rep("-",21)} #if all paralogs turned out to have alignment gap; return one unique row
+        if (length(tmp)==1) {sp.list.nonr[[s]]<-as.vector(unlist(tmp))} 
+        if (length(tmp)>1)  {tmp<-do.call(rbind,tmp) %>% as.data.frame %>% distinct(); for (j in 1:nrow(tmp)) {sp.list.nonr[[paste0(s,".",j)]]<-as.vector(unlist(tmp[j,]))}}
+      }}
+  
+  result.uniq[[names(result)[i]]]<-do.call(rbind, sp.list.nonr)
+
+}
+
+result.uniq.numeric<-list() #the 'conservation score' i.e. what % of homologs in other species have the same aminoacid as melanogaster
+
+for (i in 1:length(result.uniq)) {
+  tmp<-result.uniq[[i]] 
+  result.uniq.numeric[[names(result.uniq)[i]]] <- apply(tmp,2, function(x) {(length(which(x[2:nrow(tmp)]==x[1])))/(nrow(tmp)-1)})
+}
+
+conserv.score.table<-do.call(rbind,result.uniq.numeric)
+
+# split based on consensus, inverse consensus, and nonconsensus sites
+
+any.cons<-which(stringr::str_detect(kwin.common.df$K_window, "^.........(A|I|L|M|F|V|P|G|W)K.(D|E)"))
+any.inv<-setdiff(which(stringr::str_detect(kwin.common.df$K_window,  "^........(D|E).K(A|I|L|M|F|V|P|G|W)")),any.cons)
+n.other<-setdiff(1:nrow(kwin.common.df), c(any.cons, any.inv))
+
+score.mean.consen<-colMeans(conserv.score.table[intersect(conserved11,any.cons),])
+score.mean.inv<-colMeans(conserv.score.table[intersect(conserved11,any.inv),])
+score.mean.other<-colMeans(conserv.score.table[intersect(conserved11, n.other),])
+
+
+plot(score.mean.consen, ylim=c(0.5,1), axes = F, ylab="average conservation score", xlab="position", cex=2, type="n")
+title(paste0("bona fide sites conserved in 11 other Drosophila species, n=",length(conserved11)), cex.main=0.5)
+axis(2)
+axis(1, at=seq(1,21,1), labels=c(-10:-1,"K",1:10))
+rect(8.5,0,13.5,1,col="grey90",border = NA)
+rect(10.5,0,11.5,1,col="grey80",border = NA)
+points(score.mean.consen, pch=20, col="red",cex=2, type="b")
+points(score.mean.inv, pch=20, col="orange",cex=2, type="b")
+points(score.mean.other, pch=20, col="green4",cex=2, type="b")
+legend("topleft",c("consensus","inv.consensus","other"), pch=20, col=c("red","orange","green4"), cex=1, bty = "n")
+```
+
+
+#### Figure 2H - conservation analysis human
+
+Here we extracted DIOPT homologs with highest score from flybase and performed pairwise alignments with Muscle, default parameters
+
+
+```{r Fig2H_conservation_hum, fig.width=6, fig.height=6, out.height=600, out.width=600}
+
+result.hum<-list()
+for (i in 1:nrow(kwin.common.df)) {
+  
+  kwin<-kwin.common.df$K_window[i]
+  pos<-kwin.common.df$pos1[i] # the actual position
+  symbol<-kwin.common.df$gene[i]
+  symbol.out<-sub("\\)","_",sub("\\(","_",symbol))
+  alfile<-paste0("conservation_analysis/individual_alignments_human/",symbol.out,"_1.aln")
+  
+  if (file.exists(alfile)) {
+  aln<-seqinr::read.alignment(alfile, format = "fasta")
+  aln.seq.longer<-lapply(aln$seq,function(x) {paste0("----------",x,"----------")}) # this is a trick to make it easier when positions are towards the end of the alignment
+  
+  aln.tab<-as.data.frame(do.call(cbind,lapply(aln.seq.longer,function(x) {unlist(strsplit(x,""))})))
+  names(aln.tab)<-aln$nam
+  mel<-grep("#Dmel$",aln$nam) # where is mel in the alginment
+  aln.tab$mel.id<-apply(aln.tab,1,function(x) {length(which(x==x[mel]))})
+  
+  p<-0 #the position in the aa sequence when "-" are removed
+  for (k in 1:nrow(aln.tab)) {
+    if(aln.tab[k,mel]!='-') {p<-p+1}
+    if(p==pos) { #means that k is the corresponding position in the alignment
+     # print(paste(pos,k,paste0(aln.tab[(k-10):(k+10),mel], collapse=""))) 
+      result.hum[[paste0(symbol,"|",pos,"|",i)]]<-aln.tab[(k-10):(k+10),]
+      break
+    }}}
+}
+
+print("Numbers of genes with human ortholog")
+length(unique(sub("\\|.*","", names(result.hum)))) # number of genes with human ortholog
+
+print("Number of sites within these genes")
+length(result.hum) # numer of analyzed positions = 311; of these 311 analyzed positions, in 233 genes
+
+cons.k<-which(lapply(result.hum, function(x) { x$mel.id[11] })==2)
+print("Number of sites where the K in Drosophila is conserved in human")
+length(cons.k)
+
+
+result.hum.numeric<-lapply(result.hum, function(x) {x$mel.id-1})
+score.mean.cons<-colMeans(do.call(rbind,result.hum.numeric)[which(names(result.hum.numeric) %in% names(result[any.cons])),])
+score.mean.inv<-colMeans(do.call(rbind,result.hum.numeric)[which(names(result.hum.numeric) %in% names(result[any.inv])),])
+score.mean.other<-colMeans(do.call(rbind,result.hum.numeric)[which(names(result.hum.numeric) %in% names(result[n.other])),])
+
+plot(score.mean.cons, ylim=c(0,1), axes = F, ylab="conservation score", xlab="position", cex=2, type="n", main="Sites with human orthologs, n=311")
+axis(2)
+axis(1, at=seq(1,21,1), labels=c(-10:-1,"K",1:10))
+rect(8.5,0,13.5,1,col="grey90",border = NA)
+rect(10.5,0,11.5,1,col="grey80",border = NA)
+points(score.mean.cons, pch=20, col="red",cex=2, type="b")
+points(score.mean.inv, pch=20, col="orange",cex=2, type="b")
+points(score.mean.other, pch=20, col="green4",cex=2, type="b")
+#this results shows that sumo sites within the consensus motif have lower conservation in human, compared to those outside a motif
+#however, let's focus on sites that have a motif in Droso, and a K site in human:
+score.mean.other<-colMeans(do.call(rbind,result.hum.numeric)[which(names(result.hum.numeric) %in% names(result[n.other])),])
+points(colMeans(do.call(rbind,result.hum.numeric[intersect(names(result[any.cons]), names(cons.k))])), type="b", col="red", pch=1, lty=2, cex=1.5)
+legend("topleft",c("consensus-all","consensus-dros, K-hum","inv.consensus","other"), pch=c(20,1,20,20), col=c("red","red","orange","green4"),  bty = "n")
+
+```
+
+This is a sequence logo of the deeply conserved SUMO sites, and a table with the conserved pairs
+
+```{r Fig2H_logo, fig.width=3, fig.height=3, out.height=300, out.width=300}
+
+ggplot() + geom_logo (lapply(result.hum[intersect(names(result[any.cons]), names(cons.k))], function(x) {paste0(x[,1], collapse="")}) %>% unlist() %>% as.vector() %>% toupper()) + ggtitle("logo of human proteins at sites with consensus in D. mel and conserved K in Human")
+
+print("List of genes with conserved consensus sites in the same position in Drosophila and Human")
+#highly.conserved.sumo.sites<-sort(sub("\\|\\d+$","",names(result.hum[intersect(names(result[any.cons]), names(cons.k))])))
+highly.cons.site<-do.call(rbind,lapply(result.hum[intersect(names(result[any.cons]), names(cons.k))], function(x) {names(x)[1:2]})) 
+highly.cons.site %>% DT::datatable()
+write.table(highly.cons.site,"Table_S3.tsv", quote = F, row.names = T, col.names = F, sep="\t")
+```
+
+
+
+### Ontology analysis
+
+####Figure 3 
+
+Functional enrichment by cluster profiler for proteins which bona fide exact SUMO sites (conservative set), versus all proteins using GO version below:
+
+```{r clusterprofiler, warnings=FALSE, message=FALSE}
+gene.list<-df %>% filter(K_window %in% Reduce(intersect,x.site.merged)) %>% pull(gene) %>% sort %>% unique()
+prot.list<-df %>% filter(K_window %in% Reduce(intersect,x.site.merged)) %>% pull(prot1) %>% sort %>% unique()
+genes.universe<-unique(gene.info$SYMBOL)
+
+library(org.Dm.eg.db)
+org.Dm.eg.db
+```
+
+#### Fig3A
+
+Barplots of significantly enriched terms (reduced using semantic simplification). Note that ontologies are updated regularly and re-running this code with a different org.Dm.eg.db version may generate slightly different result (e.g. the term gene silencing was recently removed).
+
+```{r Fig3A_go_barplots, fig.width=12, fig.height=4, out.height=200, out.width=600}
+#MF
+ego.mf <- enrichGO(gene = gene.list, universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "MF", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+ego.mf.s<-simplify(ego.mf, 0.4)
+b1<-barplot(ego.mf.s, font=8, showCategory = 50) + ggtitle("GO Molecular function (reduced)")
+
+#CC
+ego.cc <- enrichGO(gene = gene.list, universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "CC", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+ego.cc.s<-simplify(ego.cc, 0.8)
+b2<-barplot(ego.cc.s, font=8, showCategory = 50) + ggtitle("GO Cellular component (reduced)")
+
+##BP
+ego <- enrichGO(gene = gene.list, universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "BP", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+ego.s<-simplify(ego, 0.4)
+b3<-barplot(ego.s,font=8, showCategory = 50) + ggtitle("GO BP enrichment (reduced")
+gridExtra::grid.arrange(b3,b1,b2, nrow=1)
+
+#BP, non sumo GG sites for comparison
+ego.nonsumo<-enrichGO(gene = unique(kwin.bad.df$gene), universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "BP", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+ego.nonsumo.cc<-enrichGO(gene = unique(kwin.bad.df$gene), universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "CC", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+ego.nonsumo.mf<-enrichGO(gene = unique(kwin.bad.df$gene), universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "MF", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+
+#sumo sites, non-conservative set (ratio>5 and sufficient to be detecteed in only 1 sample)
+ego.lowconf<-enrichGO(gene = unique(df[which(df$ratio1>=5|df$ratio2>=5|df$ratio3>=5),]$gene), universe = genes.universe, OrgDb = org.Dm.eg.db,keyType = "SYMBOL",ont= "BP", pAdjustMethod = "BH", pvalueCutoff  = 0.01, qvalueCutoff  = 0.01)
+
+write.table(data.frame(ego),"ego_bp_sumo.tab", sep="\t", quote = F)
+write.table(data.frame(ego.cc),"ego_cc_sumo.tab", sep="\t", quote = F)
+write.table(data.frame(ego.mf),"ego_mf_sumo.tab", sep="\t", quote = F)
+write.table(data.frame(ego.nonsumo),"ego_bp_nonsumo.tab", sep="\t", quote = F)
+write.table(data.frame(ego.nonsumo.cc),"ego_cc_nonsumo.tab", sep="\t", quote = F)
+write.table(data.frame(ego.nonsumo.mf),"ego_mf_nonsumo.tab", sep="\t", quote = F)
+```
+
+#### CNET plot for the BP category
+Plot shows protein members in the top 5 categories of BP simplified terms.
+
+```{r Fig3A_cnet, fig.width=8, fig.height=7, out.height=500, out.width=400}
+cnetplot(ego.s, showCategory = 5, cex_label_gene = 0.5, cex_label_category = 1, color_category = rainbow(5), max.overlaps=Inf)
+
+```
